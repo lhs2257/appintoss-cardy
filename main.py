@@ -73,21 +73,22 @@ def perspective_correct(img: np.ndarray) -> np.ndarray | None:
             print(f"[persp] c#{i} area={raw_area:.0f} below threshold, stop", flush=True)
             break
 
-        peri = cv2.arcLength(c, True)
+        # convexHull로 오목한 윤곽(빨간 줄무늬 등) 제거 후 approxPolyDP
+        hull = cv2.convexHull(c)
+        peri = cv2.arcLength(hull, True)
         approx = None
-        # eps 0.02~0.10 세밀하게 탐색 (6→3 건너뜀 방지)
         for eps in [0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.10]:
-            a = cv2.approxPolyDP(c, eps * peri, True)
+            a = cv2.approxPolyDP(hull, eps * peri, True)
             if len(a) == 4:
                 approx = a
                 break
-            print(f"[persp] c#{i} area={raw_area:.0f} eps={eps} pts={len(a)}", flush=True)
+            print(f"[persp] c#{i} hull eps={eps} pts={len(a)}", flush=True)
 
         if approx is not None:
             pts = approx.reshape(4, 2).astype(np.float32)
-            print(f"[persp] c#{i} approxPolyDP ok", flush=True)
+            print(f"[persp] c#{i} hull+approx ok", flush=True)
         else:
-            # approxPolyDP가 4점을 못 만들면 최소 외접 직사각형으로 폴백
+            # hull로도 4점 실패 시 minAreaRect 폴백
             print(f"[persp] c#{i} using minAreaRect fallback", flush=True)
             rect_box = cv2.minAreaRect(c)
             pts = cv2.boxPoints(rect_box).astype(np.float32)
