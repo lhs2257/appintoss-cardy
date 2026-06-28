@@ -55,7 +55,7 @@ def order_points(pts: np.ndarray) -> np.ndarray:
 
 
 def warp_with_corners(img: np.ndarray, pts: np.ndarray) -> np.ndarray | None:
-    """사용자가 지정한 4 꼭짓점으로 직접 perspective warp."""
+    """사용자 지정 4 꼭짓점으로 1차 warp 후, 결과 이미지에서 카드 경계 재인식해 2차 warp."""
     if len(pts) != 4:
         return None
     rect = order_points(pts)
@@ -69,10 +69,18 @@ def warp_with_corners(img: np.ndarray, pts: np.ndarray) -> np.ndarray | None:
     if maxW < 20 or maxH < 20:
         print(f"[corners] output too small {maxW}x{maxH}", flush=True)
         return None
-    print(f"[corners] warp {maxW}x{maxH}", flush=True)
+    print(f"[corners] 1st warp {maxW}x{maxH}", flush=True)
     dst = np.array([[0, 0], [maxW - 1, 0], [maxW - 1, maxH - 1], [0, maxH - 1]], dtype=np.float32)
     M = cv2.getPerspectiveTransform(rect, dst)
-    return cv2.warpPerspective(img, M, (maxW, maxH))
+    pre_corrected = cv2.warpPerspective(img, M, (maxW, maxH))
+
+    # 2차: 1차 결과에서 카드 경계를 자동 인식해 배경 제거
+    refined = perspective_correct(pre_corrected)
+    if refined is not None:
+        print(f"[corners] 2nd pass ok {refined.shape[1]}x{refined.shape[0]}", flush=True)
+        return refined
+    print("[corners] 2nd pass not found, using 1st warp", flush=True)
+    return pre_corrected
 
 
 def perspective_correct(img: np.ndarray) -> np.ndarray | None:
