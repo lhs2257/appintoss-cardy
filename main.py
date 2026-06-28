@@ -37,6 +37,7 @@ PROMPT = """이 명함 이미지에서 정보를 추출해서 아래 JSON 형식
 
 class ScanRequest(BaseModel):
     image: str
+    rotation: int = 0  # 앱 레벨 회전값 (0/90/180/270)
 
 
 def order_points(pts: np.ndarray) -> np.ndarray:
@@ -98,15 +99,25 @@ def enhance_image(img: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
 
+_ROTATE_MAP = {
+    90: cv2.ROTATE_90_CLOCKWISE,
+    180: cv2.ROTATE_180,
+    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+}
+
+
 def decode_image(img_data: bytes) -> np.ndarray:
     """EXIF 방향 보정 후 OpenCV 배열로 변환 (iOS 세로 촬영 대응)"""
     pil_img = ImageOps.exif_transpose(Image.open(io.BytesIO(img_data))).convert("RGB")
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
 
-def process_image(base64_str: str) -> str:
+def process_image(base64_str: str, rotation: int = 0) -> str:
     img_data = base64.b64decode(base64_str)
     img = decode_image(img_data)
+    # 앱 레벨 회전 적용 (갤러리 회전 버튼 대응)
+    if rotation in _ROTATE_MAP:
+        img = cv2.rotate(img, _ROTATE_MAP[rotation])
     corrected = perspective_correct(img)
     enhanced = enhance_image(corrected if corrected is not None else img)
     _, buffer = cv2.imencode(".jpg", enhanced, [cv2.IMWRITE_JPEG_QUALITY, 92])
@@ -125,7 +136,7 @@ async def scan(req: ScanRequest):
         raw_base64 = raw_base64.split("base64,", 1)[1]
 
     try:
-        processed_base64 = process_image(raw_base64)
+        processed_base64 = process_image(raw_base64, req.rotation)
     except Exception:
         processed_base64 = raw_base64
 
