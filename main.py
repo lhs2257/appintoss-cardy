@@ -55,7 +55,6 @@ def order_points(pts: np.ndarray) -> np.ndarray:
 def perspective_correct(img: np.ndarray) -> np.ndarray | None:
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # CLAHE: 지역 대비 강화 (iOS 사진 불균일 조명 대응)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -65,20 +64,24 @@ def perspective_correct(img: np.ndarray) -> np.ndarray | None:
 
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
+    print(f"[persp] img={w}x{h}, contours={len(contours)}", flush=True)
 
-    for c in contours:
+    for i, c in enumerate(contours):
+        raw_area = cv2.contourArea(c)
         peri = cv2.arcLength(c, True)
-        # 여러 epsilon 시도: iOS 사진에서 0.02가 4각형을 못 만드는 경우 대응
         approx = None
-        for eps in [0.02, 0.03, 0.05]:
+        for eps in [0.02, 0.03, 0.05, 0.08]:
             a = cv2.approxPolyDP(c, eps * peri, True)
             if len(a) == 4:
                 approx = a
                 break
+            print(f"[persp] c#{i} area={raw_area:.0f} eps={eps} pts={len(a)}", flush=True)
         if approx is None:
             continue
         area = cv2.contourArea(approx)
-        if area < w * h * 0.05:  # 10% → 5%로 완화
+        threshold = w * h * 0.05
+        print(f"[persp] c#{i} 4pts area={area:.0f} threshold={threshold:.0f}", flush=True)
+        if area < threshold:
             continue
         pts = approx.reshape(4, 2).astype(np.float32)
         rect = order_points(pts)
@@ -90,7 +93,9 @@ def perspective_correct(img: np.ndarray) -> np.ndarray | None:
         maxW = min(int(max(wA, wB)), 1200)
         maxH = min(int(max(hA, hB)), 1200)
         if maxW < 100 or maxH < 60:
+            print(f"[persp] c#{i} too small {maxW}x{maxH}", flush=True)
             continue
+        print(f"[persp] SUCCESS {maxW}x{maxH}", flush=True)
         dst = np.array(
             [[0, 0], [maxW - 1, 0], [maxW - 1, maxH - 1], [0, maxH - 1]],
             dtype=np.float32,
@@ -98,6 +103,7 @@ def perspective_correct(img: np.ndarray) -> np.ndarray | None:
         M = cv2.getPerspectiveTransform(rect, dst)
         return cv2.warpPerspective(img, M, (maxW, maxH))
 
+    print("[persp] FAIL: no valid card", flush=True)
     return None
 
 
@@ -118,14 +124,18 @@ _ROTATE_MAP = {
 
 def decode_image(img_data: bytes) -> np.ndarray:
     """EXIF 방향 보정 후 OpenCV 배열로 변환. Pillow 실패 시 cv2 폴백."""
+    print(f"[decode] bytes={len(img_data)} header={img_data[:8].hex()}", flush=True)
     try:
         pil_img = ImageOps.exif_transpose(Image.open(io.BytesIO(img_data))).convert("RGB")
+        print(f"[decode] pillow ok size={pil_img.size} mode={pil_img.mode}", flush=True)
         return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-    except Exception:
+    except Exception as e:
+        print(f"[decode] pillow fail: {e}, trying cv2", flush=True)
         np_arr = np.frombuffer(img_data, np.uint8)
         img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         if img is None:
             raise ValueError("이미지 디코딩 실패")
+        print(f"[decode] cv2 ok shape={img.shape}", flush=True)
         return img
 
 
@@ -141,28 +151,31 @@ def fix_orientation(img: np.ndarray, portrait: bool) -> np.ndarray:
 
 
 def process_image(base64_str: str, rotation: int = 0, portrait: bool = False) -> str:
+    print(f"[proc] b64_len={len(base64_str)} rotation={rotation} portrait={portrait}", flush=True)
     img_data = base64.b64decode(base64_str)
 
-    # 이미지가 너무 크면 축소 (iOS 고해상도 대응)
     img = decode_image(img_data)
     max_dim = max(img.shape[:2])
     if max_dim > 1600:
         scale = 1600 / max_dim
         h, w = img.shape[:2]
         img = cv2.resize(img, (int(w * scale), int(h * scale)))
+        print(f"[proc] resized to {img.shape[1]}x{img.shape[0]}", flush=True)
 
-    # 앱 레벨 회전 적용 (갤러리 회전 버튼 대응)
     if rotation in _ROTATE_MAP:
         img = cv2.rotate(img, _ROTATE_MAP[rotation])
+        print(f"[proc] rotated {rotation}deg", flush=True)
 
     corrected = perspective_correct(img)
     if corrected is not None:
         corrected = fix_orientation(corrected, portrait)
+        print(f"[proc] fix_orientation result shape={corrected.shape}", flush=True)
         enhanced = enhance_image(corrected)
     else:
         enhanced = enhance_image(img)
 
     _, buffer = cv2.imencode(".jpg", enhanced, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    print(f"[proc] done encoded={len(buffer)}bytes", flush=True)
     return base64.b64encode(buffer).decode("utf-8")
 
 
