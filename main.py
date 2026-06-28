@@ -55,6 +55,9 @@ def order_points(pts: np.ndarray) -> np.ndarray:
 def perspective_correct(img: np.ndarray) -> np.ndarray | None:
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # CLAHE: 지역 대비 강화 (iOS 사진 불균일 조명 대응)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blurred, 50, 150)
     kernel = np.ones((3, 3), np.uint8)
@@ -65,11 +68,17 @@ def perspective_correct(img: np.ndarray) -> np.ndarray | None:
 
     for c in contours:
         peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) != 4:
+        # 여러 epsilon 시도: iOS 사진에서 0.02가 4각형을 못 만드는 경우 대응
+        approx = None
+        for eps in [0.02, 0.03, 0.05]:
+            a = cv2.approxPolyDP(c, eps * peri, True)
+            if len(a) == 4:
+                approx = a
+                break
+        if approx is None:
             continue
         area = cv2.contourArea(approx)
-        if area < w * h * 0.1:
+        if area < w * h * 0.05:  # 10% → 5%로 완화
             continue
         pts = approx.reshape(4, 2).astype(np.float32)
         rect = order_points(pts)
@@ -78,7 +87,6 @@ def perspective_correct(img: np.ndarray) -> np.ndarray | None:
         wB = float(np.linalg.norm(tr - tl))
         hA = float(np.linalg.norm(tr - br))
         hB = float(np.linalg.norm(tl - bl))
-        # 가로/세로 상한을 동일하게 1200으로 설정 (기존 maxH=800 가로 편향 제거)
         maxW = min(int(max(wA, wB)), 1200)
         maxH = min(int(max(hA, hB)), 1200)
         if maxW < 100 or maxH < 60:
