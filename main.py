@@ -8,7 +8,8 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageOps
+import io
 
 app = FastAPI()
 
@@ -97,10 +98,15 @@ def enhance_image(img: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
 
+def decode_image(img_data: bytes) -> np.ndarray:
+    """EXIF 방향 보정 후 OpenCV 배열로 변환 (iOS 세로 촬영 대응)"""
+    pil_img = ImageOps.exif_transpose(Image.open(io.BytesIO(img_data))).convert("RGB")
+    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+
 def process_image(base64_str: str) -> str:
     img_data = base64.b64decode(base64_str)
-    np_arr = np.frombuffer(img_data, np.uint8)
-    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    img = decode_image(img_data)
     corrected = perspective_correct(img)
     enhanced = enhance_image(corrected if corrected is not None else img)
     _, buffer = cv2.imencode(".jpg", enhanced, [cv2.IMWRITE_JPEG_QUALITY, 92])
