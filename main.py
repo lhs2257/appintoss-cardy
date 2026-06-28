@@ -37,8 +37,9 @@ PROMPT = """이 명함 이미지에서 정보를 추출해서 아래 JSON 형식
 
 class ScanRequest(BaseModel):
     image: str
-    rotation: int = 0      # 앱 레벨 회전값 (0/90/180/270)
-    portrait: bool = False  # 세로형 크롭 여부 (앱 UI 선택값)
+    rotation: int = 0       # 앱 레벨 회전값 (0/90/180/270)
+    portrait: bool = False   # 세로형 크롭 여부 (앱 UI 선택값)
+    cropRect: dict | None = None  # {x,y,w,h} 정규화 0-1, 회전 후 좌표계
 
 
 def order_points(pts: np.ndarray) -> np.ndarray:
@@ -73,23 +74,21 @@ def perspective_correct(img: np.ndarray) -> np.ndarray | None:
             print(f"[persp] c#{i} area={raw_area:.0f} below threshold, stop", flush=True)
             break
 
-        # convexHull로 오목한 윤곽(빨간 줄무늬 등) 제거 후 approxPolyDP
-        hull = cv2.convexHull(c)
-        peri = cv2.arcLength(hull, True)
+        peri = cv2.arcLength(c, True)
         approx = None
         for eps in [0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.10]:
-            a = cv2.approxPolyDP(hull, eps * peri, True)
+            a = cv2.approxPolyDP(c, eps * peri, True)
             if len(a) == 4:
                 approx = a
                 break
-            print(f"[persp] c#{i} hull eps={eps} pts={len(a)}", flush=True)
+            print(f"[persp] c#{i} area={raw_area:.0f} eps={eps} pts={len(a)}", flush=True)
 
         if approx is not None:
             pts = approx.reshape(4, 2).astype(np.float32)
-            print(f"[persp] c#{i} hull+approx ok", flush=True)
+            print(f"[persp] c#{i} approxPolyDP ok", flush=True)
         else:
-            # hull로도 4점 실패 시 minAreaRect 폴백
-            print(f"[persp] c#{i} using minAreaRect fallback", flush=True)
+            # approxPolyDP 실패 시 minAreaRect 폴백
+            print(f"[persp] c#{i} minAreaRect fallback", flush=True)
             rect_box = cv2.minAreaRect(c)
             pts = cv2.boxPoints(rect_box).astype(np.float32)
 
@@ -159,8 +158,13 @@ def fix_orientation(img: np.ndarray, portrait: bool) -> np.ndarray:
     return img
 
 
-def process_image(base64_str: str, rotation: int = 0, portrait: bool = False) -> str:
-    print(f"[proc] b64_len={len(base64_str)} rotation={rotation} portrait={portrait}", flush=True)
+def process_image(
+    base64_str: str,
+    rotation: int = 0,
+    portrait: bool = False,
+    crop_rect: dict | None = None,
+) -> str:
+    print(f"[proc] b64_len={len(base64_str)} rotation={rotation} portrait={portrait} crop={crop_rect}", flush=True)
     img_data = base64.b64decode(base64_str)
 
     img = decode_image(img_data)
@@ -171,9 +175,21 @@ def process_image(base64_str: str, rotation: int = 0, portrait: bool = False) ->
         img = cv2.resize(img, (int(w * scale), int(h * scale)))
         print(f"[proc] resized to {img.shape[1]}x{img.shape[0]}", flush=True)
 
+    # 앱 레벨 회전 (cropRect 좌표계와 맞추기 위해 크롭 전 적용)
     if rotation in _ROTATE_MAP:
         img = cv2.rotate(img, _ROTATE_MAP[rotation])
-        print(f"[proc] rotated {rotation}deg", flush=True)
+        print(f"[proc] rotated {rotation}deg → {img.shape[1]}x{img.shape[0]}", flush=True)
+
+    # 사용자가 선택한 영역만 크롭 → perspective_correct 정확도 대폭 향상
+    if crop_rect:
+        h2, w2 = img.shape[:2]
+        x1 = max(0, int(crop_rect['x'] * w2))
+        y1 = max(0, int(crop_rect['y'] * h2))
+        x2 = min(w2, int((crop_rect['x'] + crop_rect['w']) * w2))
+        y2 = min(h2, int((crop_rect['y'] + crop_rect['h']) * h2))
+        if x2 > x1 and y2 > y1:
+            img = img[y1:y2, x1:x2]
+            print(f"[proc] cropped to {img.shape[1]}x{img.shape[0]}", flush=True)
 
     corrected = perspective_correct(img)
     if corrected is not None:
@@ -181,6 +197,7 @@ def process_image(base64_str: str, rotation: int = 0, portrait: bool = False) ->
         print(f"[proc] fix_orientation result shape={corrected.shape}", flush=True)
         enhanced = enhance_image(corrected)
     else:
+        # cropRect로 이미 카드 영역이 잘렸으므로 img 자체가 유효한 카드 영역
         enhanced = enhance_image(img)
 
     _, buffer = cv2.imencode(".jpg", enhanced, [cv2.IMWRITE_JPEG_QUALITY, 92])
@@ -201,7 +218,7 @@ async def scan(req: ScanRequest):
 
     processed_base64: str | None = None
     try:
-        processed_base64 = process_image(raw_base64, req.rotation, req.portrait)
+        processed_base64 = process_image(raw_base64, req.rotation, req.portrait, req.cropRect)
     except Exception:
         # 처리 실패 시 원본 이미지를 GPT에 전달하되 correctedImage는 반환하지 않음
         pass
