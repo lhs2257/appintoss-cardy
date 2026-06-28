@@ -37,9 +37,10 @@ PROMPT = """이 명함 이미지에서 정보를 추출해서 아래 JSON 형식
 
 class ScanRequest(BaseModel):
     image: str
-    rotation: int = 0       # 앱 레벨 회전값 (0/90/180/270)
-    portrait: bool = False   # 세로형 크롭 여부 (앱 UI 선택값)
-    cropRect: dict | None = None  # {x,y,w,h} 정규화 0-1, 회전 후 좌표계
+    rotation: int = 0
+    portrait: bool = False
+    cropRect: dict | None = None  # legacy
+    corners: list | None = None   # [{x,y}×4] 정규화 0-1, 회전 후 좌표계
 
 
 def order_points(pts: np.ndarray) -> np.ndarray:
@@ -51,6 +52,27 @@ def order_points(pts: np.ndarray) -> np.ndarray:
     rect[1] = pts[np.argmin(diff)] # top-right
     rect[3] = pts[np.argmax(diff)] # bottom-left
     return rect
+
+
+def warp_with_corners(img: np.ndarray, pts: np.ndarray) -> np.ndarray | None:
+    """사용자가 지정한 4 꼭짓점으로 직접 perspective warp."""
+    if len(pts) != 4:
+        return None
+    rect = order_points(pts)
+    (tl, tr, br, bl) = rect
+    wA = float(np.linalg.norm(br - bl))
+    wB = float(np.linalg.norm(tr - tl))
+    hA = float(np.linalg.norm(tr - br))
+    hB = float(np.linalg.norm(tl - bl))
+    maxW = min(int(max(wA, wB)), 1400)
+    maxH = min(int(max(hA, hB)), 1400)
+    if maxW < 20 or maxH < 20:
+        print(f"[corners] output too small {maxW}x{maxH}", flush=True)
+        return None
+    print(f"[corners] warp {maxW}x{maxH}", flush=True)
+    dst = np.array([[0, 0], [maxW - 1, 0], [maxW - 1, maxH - 1], [0, maxH - 1]], dtype=np.float32)
+    M = cv2.getPerspectiveTransform(rect, dst)
+    return cv2.warpPerspective(img, M, (maxW, maxH))
 
 
 def perspective_correct(img: np.ndarray) -> np.ndarray | None:
@@ -160,8 +182,9 @@ def process_image(
     rotation: int = 0,
     portrait: bool = False,
     crop_rect: dict | None = None,
+    corners: list | None = None,
 ) -> str:
-    print(f"[proc] b64_len={len(base64_str)} rotation={rotation} portrait={portrait} crop={crop_rect}", flush=True)
+    print(f"[proc] b64_len={len(base64_str)} rotation={rotation} corners={bool(corners)} crop={bool(crop_rect)}", flush=True)
     img_data = base64.b64decode(base64_str)
 
     img = decode_image(img_data)
@@ -172,13 +195,21 @@ def process_image(
         img = cv2.resize(img, (int(w * scale), int(h * scale)))
         print(f"[proc] resized to {img.shape[1]}x{img.shape[0]}", flush=True)
 
-    # 앱 레벨 회전 (cropRect 좌표계와 맞추기 위해 크롭 전 적용)
     if rotation in _ROTATE_MAP:
         img = cv2.rotate(img, _ROTATE_MAP[rotation])
         print(f"[proc] rotated {rotation}deg → {img.shape[1]}x{img.shape[0]}", flush=True)
 
-    # 사용자가 선택한 영역만 크롭 → perspective_correct 정확도 대폭 향상
-    if crop_rect:
+    if corners:
+        # 사용자 지정 4 꼭짓점 → 직접 warpPerspective
+        h2, w2 = img.shape[:2]
+        pts = np.array([[c['x'] * w2, c['y'] * h2] for c in corners], dtype=np.float32)
+        corrected = warp_with_corners(img, pts)
+        if corrected is not None:
+            enhanced = enhance_image(corrected)
+        else:
+            enhanced = enhance_image(img)
+    elif crop_rect:
+        # legacy: 직사각형 크롭 후 자동 perspective
         h2, w2 = img.shape[:2]
         x1 = max(0, int(crop_rect['x'] * w2))
         y1 = max(0, int(crop_rect['y'] * h2))
@@ -186,23 +217,23 @@ def process_image(
         y2 = min(h2, int((crop_rect['y'] + crop_rect['h']) * h2))
         if x2 > x1 and y2 > y1:
             img = img[y1:y2, x1:x2]
-            print(f"[proc] cropped to {img.shape[1]}x{img.shape[0]}", flush=True)
-
-    corrected = perspective_correct(img)
-    if corrected is not None:
-        # 어두운 영역이 변환된 경우(잘못된 perspective) 폴백
-        gray_mean = float(cv2.mean(cv2.cvtColor(corrected, cv2.COLOR_BGR2GRAY))[0])
-        print(f"[proc] perspective gray_mean={gray_mean:.1f}", flush=True)
-        if gray_mean < 40:
-            print("[proc] too dark, skip perspective", flush=True)
-            corrected = None
-    if corrected is not None:
-        corrected = fix_orientation(corrected, portrait)
-        print(f"[proc] fix_orientation result shape={corrected.shape}", flush=True)
-        enhanced = enhance_image(corrected)
+        corrected = perspective_correct(img)
+        if corrected is not None:
+            gray_mean = float(cv2.mean(cv2.cvtColor(corrected, cv2.COLOR_BGR2GRAY))[0])
+            if gray_mean < 40:
+                corrected = None
+        if corrected is not None:
+            corrected = fix_orientation(corrected, portrait)
+            enhanced = enhance_image(corrected)
+        else:
+            enhanced = enhance_image(img)
     else:
-        # cropRect로 이미 카드 영역이 잘렸으므로 img 자체가 유효한 카드 영역
-        enhanced = enhance_image(img)
+        corrected = perspective_correct(img)
+        if corrected is not None:
+            corrected = fix_orientation(corrected, portrait)
+            enhanced = enhance_image(corrected)
+        else:
+            enhanced = enhance_image(img)
 
     _, buffer = cv2.imencode(".jpg", enhanced, [cv2.IMWRITE_JPEG_QUALITY, 92])
     print(f"[proc] done encoded={len(buffer)}bytes", flush=True)
@@ -222,7 +253,7 @@ async def scan(req: ScanRequest):
 
     processed_base64: str | None = None
     try:
-        processed_base64 = process_image(raw_base64, req.rotation, req.portrait, req.cropRect)
+        processed_base64 = process_image(raw_base64, req.rotation, req.portrait, req.cropRect, req.corners)
     except Exception:
         # 처리 실패 시 원본 이미지를 GPT에 전달하되 correctedImage는 반환하지 않음
         pass
