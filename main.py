@@ -64,26 +64,34 @@ def perspective_correct(img: np.ndarray) -> np.ndarray | None:
 
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
-    print(f"[persp] img={w}x{h}, contours={len(contours)}", flush=True)
+    threshold = w * h * 0.05
+    print(f"[persp] img={w}x{h}, contours={len(contours)} thr={threshold:.0f}", flush=True)
 
     for i, c in enumerate(contours):
         raw_area = cv2.contourArea(c)
+        if raw_area < threshold:
+            print(f"[persp] c#{i} area={raw_area:.0f} below threshold, stop", flush=True)
+            break
+
         peri = cv2.arcLength(c, True)
         approx = None
-        for eps in [0.02, 0.03, 0.05, 0.08]:
+        # eps 0.02~0.10 세밀하게 탐색 (6→3 건너뜀 방지)
+        for eps in [0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.10]:
             a = cv2.approxPolyDP(c, eps * peri, True)
             if len(a) == 4:
                 approx = a
                 break
             print(f"[persp] c#{i} area={raw_area:.0f} eps={eps} pts={len(a)}", flush=True)
-        if approx is None:
-            continue
-        area = cv2.contourArea(approx)
-        threshold = w * h * 0.05
-        print(f"[persp] c#{i} 4pts area={area:.0f} threshold={threshold:.0f}", flush=True)
-        if area < threshold:
-            continue
-        pts = approx.reshape(4, 2).astype(np.float32)
+
+        if approx is not None:
+            pts = approx.reshape(4, 2).astype(np.float32)
+            print(f"[persp] c#{i} approxPolyDP ok", flush=True)
+        else:
+            # approxPolyDP가 4점을 못 만들면 최소 외접 직사각형으로 폴백
+            print(f"[persp] c#{i} using minAreaRect fallback", flush=True)
+            rect_box = cv2.minAreaRect(c)
+            pts = cv2.boxPoints(rect_box).astype(np.float32)
+
         rect = order_points(pts)
         (tl, tr, br, bl) = rect
         wA = float(np.linalg.norm(br - bl))
@@ -95,7 +103,7 @@ def perspective_correct(img: np.ndarray) -> np.ndarray | None:
         if maxW < 100 or maxH < 60:
             print(f"[persp] c#{i} too small {maxW}x{maxH}", flush=True)
             continue
-        print(f"[persp] SUCCESS {maxW}x{maxH}", flush=True)
+        print(f"[persp] SUCCESS c#{i} {maxW}x{maxH}", flush=True)
         dst = np.array(
             [[0, 0], [maxW - 1, 0], [maxW - 1, maxH - 1], [0, maxH - 1]],
             dtype=np.float32,
