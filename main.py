@@ -83,14 +83,11 @@ def perspective_correct(img: np.ndarray) -> np.ndarray | None:
                 break
             print(f"[persp] c#{i} area={raw_area:.0f} eps={eps} pts={len(a)}", flush=True)
 
-        if approx is not None:
-            pts = approx.reshape(4, 2).astype(np.float32)
-            print(f"[persp] c#{i} approxPolyDP ok", flush=True)
-        else:
-            # approxPolyDP 실패 시 minAreaRect 폴백
-            print(f"[persp] c#{i} minAreaRect fallback", flush=True)
-            rect_box = cv2.minAreaRect(c)
-            pts = cv2.boxPoints(rect_box).astype(np.float32)
+        if approx is None:
+            print(f"[persp] c#{i} no 4-pt approx, skip", flush=True)
+            continue
+        pts = approx.reshape(4, 2).astype(np.float32)
+        print(f"[persp] c#{i} approxPolyDP ok", flush=True)
 
         rect = order_points(pts)
         (tl, tr, br, bl) = rect
@@ -192,6 +189,13 @@ def process_image(
             print(f"[proc] cropped to {img.shape[1]}x{img.shape[0]}", flush=True)
 
     corrected = perspective_correct(img)
+    if corrected is not None:
+        # 어두운 영역이 변환된 경우(잘못된 perspective) 폴백
+        gray_mean = float(cv2.mean(cv2.cvtColor(corrected, cv2.COLOR_BGR2GRAY))[0])
+        print(f"[proc] perspective gray_mean={gray_mean:.1f}", flush=True)
+        if gray_mean < 40:
+            print("[proc] too dark, skip perspective", flush=True)
+            corrected = None
     if corrected is not None:
         corrected = fix_orientation(corrected, portrait)
         print(f"[proc] fix_orientation result shape={corrected.shape}", flush=True)
