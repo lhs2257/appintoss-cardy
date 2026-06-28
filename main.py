@@ -37,7 +37,8 @@ PROMPT = """이 명함 이미지에서 정보를 추출해서 아래 JSON 형식
 
 class ScanRequest(BaseModel):
     image: str
-    rotation: int = 0  # 앱 레벨 회전값 (0/90/180/270)
+    rotation: int = 0      # 앱 레벨 회전값 (0/90/180/270)
+    portrait: bool = False  # 세로형 크롭 여부 (앱 UI 선택값)
 
 
 def order_points(pts: np.ndarray) -> np.ndarray:
@@ -77,8 +78,9 @@ def perspective_correct(img: np.ndarray) -> np.ndarray | None:
         wB = float(np.linalg.norm(tr - tl))
         hA = float(np.linalg.norm(tr - br))
         hB = float(np.linalg.norm(tl - bl))
+        # 가로/세로 상한을 동일하게 1200으로 설정 (기존 maxH=800 가로 편향 제거)
         maxW = min(int(max(wA, wB)), 1200)
-        maxH = min(int(max(hA, hB)), 800)
+        maxH = min(int(max(hA, hB)), 1200)
         if maxW < 100 or maxH < 60:
             continue
         dst = np.array(
@@ -107,19 +109,51 @@ _ROTATE_MAP = {
 
 
 def decode_image(img_data: bytes) -> np.ndarray:
-    """EXIF 방향 보정 후 OpenCV 배열로 변환 (iOS 세로 촬영 대응)"""
-    pil_img = ImageOps.exif_transpose(Image.open(io.BytesIO(img_data))).convert("RGB")
-    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    """EXIF 방향 보정 후 OpenCV 배열로 변환. Pillow 실패 시 cv2 폴백."""
+    try:
+        pil_img = ImageOps.exif_transpose(Image.open(io.BytesIO(img_data))).convert("RGB")
+        return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    except Exception:
+        np_arr = np.frombuffer(img_data, np.uint8)
+        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError("이미지 디코딩 실패")
+        return img
 
 
-def process_image(base64_str: str, rotation: int = 0) -> str:
+def fix_orientation(img: np.ndarray, portrait: bool) -> np.ndarray:
+    """앱에서 선택한 크롭 방향과 보정 결과 방향이 불일치하면 90° 회전."""
+    h, w = img.shape[:2]
+    is_landscape = w > h
+    if portrait and is_landscape:
+        return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    if not portrait and not is_landscape:
+        return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    return img
+
+
+def process_image(base64_str: str, rotation: int = 0, portrait: bool = False) -> str:
     img_data = base64.b64decode(base64_str)
+
+    # 이미지가 너무 크면 축소 (iOS 고해상도 대응)
     img = decode_image(img_data)
+    max_dim = max(img.shape[:2])
+    if max_dim > 1600:
+        scale = 1600 / max_dim
+        h, w = img.shape[:2]
+        img = cv2.resize(img, (int(w * scale), int(h * scale)))
+
     # 앱 레벨 회전 적용 (갤러리 회전 버튼 대응)
     if rotation in _ROTATE_MAP:
         img = cv2.rotate(img, _ROTATE_MAP[rotation])
+
     corrected = perspective_correct(img)
-    enhanced = enhance_image(corrected if corrected is not None else img)
+    if corrected is not None:
+        corrected = fix_orientation(corrected, portrait)
+        enhanced = enhance_image(corrected)
+    else:
+        enhanced = enhance_image(img)
+
     _, buffer = cv2.imencode(".jpg", enhanced, [cv2.IMWRITE_JPEG_QUALITY, 92])
     return base64.b64encode(buffer).decode("utf-8")
 
@@ -135,10 +169,14 @@ async def scan(req: ScanRequest):
     if "base64," in raw_base64:
         raw_base64 = raw_base64.split("base64,", 1)[1]
 
+    processed_base64: str | None = None
     try:
-        processed_base64 = process_image(raw_base64, req.rotation)
+        processed_base64 = process_image(raw_base64, req.rotation, req.portrait)
     except Exception:
-        processed_base64 = raw_base64
+        # 처리 실패 시 원본 이미지를 GPT에 전달하되 correctedImage는 반환하지 않음
+        pass
+
+    ocr_image = processed_base64 if processed_base64 is not None else raw_base64
 
     payload = {
         "model": "gpt-4o-mini",
@@ -148,7 +186,7 @@ async def scan(req: ScanRequest):
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": f"data:image/jpeg;base64,{processed_base64}",
+                        "url": f"data:image/jpeg;base64,{ocr_image}",
                         "detail": "high",
                     },
                 },
@@ -192,5 +230,5 @@ async def scan(req: ScanRequest):
         "phone": parsed.get("phone"),
         "email": parsed.get("email"),
         "rawText": raw_text,
-        "correctedImage": processed_base64,
+        "correctedImage": processed_base64,  # 처리 실패 시 None → 앱이 원본 cropRect 표시
     }
