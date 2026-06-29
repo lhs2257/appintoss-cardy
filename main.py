@@ -43,6 +43,10 @@ class ScanRequest(BaseModel):
     corners: list | None = None   # [{x,y}×4] 정규화 0-1, 회전 후 좌표계
 
 
+class QRRequest(BaseModel):
+    image: str
+
+
 def order_points(pts: np.ndarray) -> np.ndarray:
     rect = np.zeros((4, 2), dtype=np.float32)
     s = pts.sum(axis=1)
@@ -251,6 +255,27 @@ def process_image(
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.post("/detect-qr")
+async def detect_qr(req: QRRequest):
+    raw_base64 = req.image
+    if "base64," in raw_base64:
+        raw_base64 = raw_base64.split("base64,", 1)[1]
+    try:
+        img_data = base64.b64decode(raw_base64)
+        img = decode_image(img_data)
+        detector = cv2.QRCodeDetector()
+        data, _, _ = detector.detectAndDecode(img)
+        if data:
+            print(f"[qr] detected: {data[:80]}", flush=True)
+            return {"url": data}
+        raise HTTPException(status_code=404, detail="QR 코드를 인식할 수 없어요")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[qr] error: {e}", flush=True)
+        raise HTTPException(status_code=500, detail="QR 처리 중 오류가 발생했어요")
 
 
 @app.post("/scan")
