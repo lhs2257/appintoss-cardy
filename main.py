@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from PIL import Image, ImageEnhance, ImageOps
+from pyzbar import pyzbar
 import io
 
 app = FastAPI()
@@ -257,6 +258,40 @@ async def health():
     return {"status": "ok"}
 
 
+def _try_decode_qr(img: np.ndarray) -> str | None:
+    """OpenCV → pyzbar 순서로 QR 디코딩 시도."""
+    detector = cv2.QRCodeDetector()
+    data, _, _ = detector.detectAndDecode(img)
+    if data:
+        return data
+
+    pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    results = pyzbar.decode(pil)
+    if results:
+        return results[0].data.decode("utf-8")
+    return None
+
+
+def _qr_variants(img: np.ndarray):
+    """원본 + 전처리 변형 이미지를 순서대로 반환."""
+    yield img
+
+    # 고해상도 업스케일 (화면 촬영 시 QR이 작을 때)
+    h, w = img.shape[:2]
+    if max(h, w) < 1200:
+        scale = 1200 / max(h, w)
+        yield cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+
+    # 그레이스케일 → 적응형 이진화 (글레어 제거)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+    yield cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+
+    # 샤프닝
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    yield cv2.filter2D(img, -1, kernel)
+
+
 @app.post("/detect-qr")
 async def detect_qr(req: QRRequest):
     raw_base64 = req.image
@@ -265,11 +300,13 @@ async def detect_qr(req: QRRequest):
     try:
         img_data = base64.b64decode(raw_base64)
         img = decode_image(img_data)
-        detector = cv2.QRCodeDetector()
-        data, _, _ = detector.detectAndDecode(img)
-        if data:
-            print(f"[qr] detected: {data[:80]}", flush=True)
-            return {"url": data}
+
+        for variant in _qr_variants(img):
+            data = _try_decode_qr(variant)
+            if data:
+                print(f"[qr] detected: {data[:80]}", flush=True)
+                return {"url": data}
+
         raise HTTPException(status_code=404, detail="QR 코드를 인식할 수 없어요")
     except HTTPException:
         raise
